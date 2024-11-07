@@ -1,0 +1,196 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for Excel summarization Lambda function'
+
+Parameters:
+  S3BucketName:
+    Type: String
+    Description: Name of the S3 bucket containing the Excel file
+
+  ExcelFileName:
+    Type: String
+    Description: Name of the Excel file in the S3 bucket
+
+  SenderEmail:
+    Type: String
+    Description: Email address to send from
+
+  RecipientEmail:
+    Type: String
+    Description: Email address to send to
+
+  LambdaLayerArn:
+    Type: String
+    Default: arn:aws:lambda:us-east-1:336392948345:layer:AWSSDKPandas-Python312:13
+    Description: ARN of the Lambda Layer containing pandas and other dependencies
+
+Resources:
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub 'arn:aws:s3:::${S3BucketName}/*'
+        - PolicyName: SESAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ses:SendRawEmail
+                Resource: '*'
+        - PolicyName: BedrockAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: '*'
+
+  ExcelSummarizerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ExcelSummarizerFunction
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.12
+      Timeout: 300
+      MemorySize: 128
+      Environment:
+        Variables:
+          S3_BUCKET_NAME: !Ref S3BucketName
+          EXCEL_FILE_NAME: !Ref ExcelFileName
+          SENDER_EMAIL: !Ref SenderEmail
+          recipient: !Ref RecipientEmail
+      Layers:
+        - !Ref LambdaLayerArn
+      Code:
+        ZipFile: |
+          import pandas as pd
+          import boto3
+          import json
+          import os
+          import io
+          from io import StringIO
+          import base64
+          from botocore.exceptions import ClientError
+          from email.mime.multipart import MIMEMultipart
+          from email.mime.text import MIMEText
+          from email.mime.application import MIMEApplication
+
+          s3_client = boto3.client('s3')
+          file_content = ""
+
+          def read_excel_from_s3():
+              s3_Bucket_Name = os.environ['S3_BUCKET_NAME']
+              s3_File_Name = os.environ['EXCEL_FILE_NAME']
+              response = s3_client.get_object(Bucket=s3_Bucket_Name, Key=s3_File_Name)
+              content = response['Body'].read()
+              df = pd.read_excel(io.BytesIO(content))
+              global file_content
+              file_content = content
+              return df
+
+          def read_file_from_s3():
+              s3_Bucket_Name = os.environ['S3_BUCKET_NAME']
+              s3_File_Name = os.environ['EXCEL_FILE_NAME']
+              response = s3_client.get_object(Bucket=s3_Bucket_Name, Key=s3_File_Name)
+              content = response['Body'].read()
+              return content
+
+          def chunk_dataframe(df, chunk_size=1000):
+              return [df[i:i+chunk_size] for i in range(0, len(df), chunk_size)]
+
+          def prepare_prompt(chunk):
+              excel_content = chunk.to_string()
+              prompt = f"Please summarize the top trusted advisor recommendation in a bulleted list from:\n\n{excel_content}\n\n. please make sure each bullet must start in new line"
+              return prompt
+
+          def invoke_claude(prompt):
+              bedrock_runtime = boto3.client('bedrock-runtime')
+              body = json.dumps({
+                  "prompt": f"\n\nHuman: {prompt}\n\nAssistant: Here's a summary of the Excel file contents:",
+                  "max_tokens_to_sample": 2048,
+                  "temperature": 0.5,
+                  "top_p": 0.9,
+              })
+              response = bedrock_runtime.invoke_model(
+                  body=body,
+                  modelId="anthropic.claude-v2:1",
+                  accept="application/json",
+                  contentType="application/json"
+              )
+              response_body = json.loads(response.get('body').read())
+              return response_body['completion']
+
+          def summarize_excel():
+              df = read_excel_from_s3()
+              chunks = chunk_dataframe(df)
+              summaries = []
+              for chunk in chunks:
+                  prompt = prepare_prompt(chunk)
+                  summary = invoke_claude(prompt)
+                  summaries.append(summary)
+              final_prompt = f"Here are summaries of different parts of an Excel file. Please provide an overall summary:\n\n{''.join(summaries)}"
+              final_summary = invoke_claude(final_prompt)
+              return final_summary
+
+          def send_email(sender, recipient, subject, body_text, body_html=None):
+              client = boto3.client('ses', region_name='us-east-1')
+              msg = MIMEMultipart('mixed')
+              msg['Subject'] = subject
+              msg['From'] = sender
+              msg['To'] = recipient
+              msg_body = MIMEMultipart('alternative')
+              textpart = MIMEText(body_text.encode('utf-8'), 'plain', 'utf-8')
+              htmlpart = MIMEText(body_html.encode('utf-8'), 'html', 'utf-8')
+              msg_body.attach(textpart)
+              msg_body.attach(htmlpart)
+              msg.attach(msg_body)
+              file_content = read_file_from_s3()
+              attachment = MIMEApplication(file_content)
+              attachment.add_header('Content-Disposition', 'attachment', filename=os.environ['EXCEL_FILE_NAME'])
+              msg.attach(attachment)
+              try:
+                  response = client.send_raw_email(
+                      Source=sender,
+                      Destinations=[recipient],
+                      RawMessage={'Data': msg.as_string()}
+                  )
+                  print(f"Email sent! Message ID: {response['MessageId']}")
+                  return True
+              except ClientError as e:
+                  print(f"An error occurred: {e.response['Error']['Message']}")
+                  return False
+
+          def lambda_handler(event, context):
+              summary = summarize_excel()
+              sender = os.environ['SENDER_EMAIL']
+              recipient =  os.environ['recipient']
+              subject = "Excel File Summary"
+              body_text = summary
+              body_html = f"<html><body><h1>Excel File Summary</h1><p>{summary}</p></body></html>"
+              if send_email(sender, recipient, subject, body_text, body_html):
+                  return {'statusCode': 200, 'body': 'Email sent successfully'}
+              else:
+                  return {'statusCode': 500, 'body': 'Failed to send email'}
+
+Outputs:
+  LambdaFunctionName:
+    Description: Name of the created Lambda function
+    Value: !Ref ExcelSummarizerFunction
